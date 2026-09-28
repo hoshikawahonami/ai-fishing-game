@@ -20,6 +20,7 @@
 - **确定性**：内置 mulberry32 PRNG，状态全部序列化进存档。**同一个种子 + 同一串指令 = 逐位可复现的结果**。便于复盘、测试、分享同一局。
 - **盲玩**：可以让 AI 在**不剧透**的前提下玩 —— 它不知道有哪些鱼、稀有鱼在哪、概率多少，全靠一竿一竿亲手发现。
 - **存档独立**：游戏状态存在磁盘文件里，**不在对话上下文里**。AI 的对话被清空，钓鱼进度也不会丢。
+- **存档码导出 / 导入**：`export` 把整局进度（图鉴、漂流瓶纸条、已解锁地点/潜水点、物品、随机状态…）压成一行文本；换了对话窗口、沙箱被重置，`import <存档码>` 就能原样恢复。
 - **省 token**：支持一次「连钓 N 竿」，只回一个汇总（精彩的留全文、杂鱼折叠成清点）；还能用 `;` 或换行把多条指令串成一批一次跑（买饵→抛竿、换地点→抛竿）。每次返回末尾附一行紧凑 `📊` 状态栏 JSON，AI 看它就够、不必反复查状态。不用一竿一条消息来回烧上下文。
 
 ---
@@ -97,6 +98,8 @@ print(engine.new_game(2024))         # 用种子 2024 重开一局
 | `open <宝箱uid>` | 打开钓上来的宝箱 |
 | `encyclopedia` | 图鉴收集进度 |
 | `look <id或中文名>` | 细看鱼 / 地点 / 鱼饵 / 季节 / 物品（没钓到的鱼显示 ？？？） |
+| `export` / `export json` | 导出存档码（一行文本）/ 可读 JSON，保存好以备恢复 |
+| `import <存档码或JSON>` | 从导出的内容恢复进度（覆盖当前局，原存档先备份为 `fishing_save.json.bak`）；须单独一条发，不参与 `;` 批量 |
 | `A; B; C`（`;` 或换行串联） | 把多条指令排成一批、一次按序执行（最多 8 条），如 `buy basic_worm 10; cast 10`、`goto reed_river; cast 8 stop=new` |
 
 ### 连钓省 token（重点）
@@ -137,6 +140,27 @@ goto reed_river; cast 8 stop=new      # 换到芦苇河，连钓 8 竿、钓到�
 - 确定性：mulberry32 PRNG，随机状态序列化进存档。**同 seed + 同指令序列 → 结果完全一致**。默认种子 `0x9e3779b9`。
 - 想多人各自一局：给每个玩家一个独立的工作目录（各有各的 `fishing_save.json`）。
 
+### 存档导出 / 导入（跨对话、跨沙箱恢复）
+
+AI 的代码沙箱经常随对话一起消失，`fishing_save.json` 也就没了。解决办法是让 AI（或你）时不时导出一份存档码存起来：
+
+```python
+print(engine.cmd("export"))        # 💾 ... FISH1.3f9a0c12.eNqVVMGS4iAQ...（一行文本）
+print(engine.cmd("export json"))   # 可读的存档 JSON（想手动查看/备份时用）
+
+# 新对话 / 新沙箱里：
+print(engine.cmd("import FISH1.3f9a0c12.eNqVVMGS4iAQ..."))   # ✅ 存档已恢复！
+
+# 也可以直接用 Python 接口：
+code = engine.export_save()          # 存档码；export_save("json") 得 JSON
+engine.import_save(code)             # 存档码或 JSON 都认
+```
+
+- 存档码 = `FISH1.<校验和>.<压缩后的存档>`，纯 ASCII、不含 `;` 和空格。导入时会自动去掉聊天窗口加的折行、引号、``` 代码块。
+- 带 **CRC32 校验**：复制漏了 / 多了字符会直接报错，**当前存档保持不动**，不会读进半截进度。
+- 包含全部进度：点数、图鉴、已读漂流瓶纸条、已解锁钓点/潜水点、藏宝图碎片、渔篓、物品、宝箱、鱼饵、氧气瓶，连**随机数状态**都在——导入后继续玩，结果和没中断时逐位一致。
+- 导入会覆盖当前局；覆盖前把原存档备份到 `fishing_save.json.bak`，导错了还能找回。老版本导出的存档会自动补齐新字段。
+
 ---
 
 ## 接到你的 AI 上（三种接法，自己挑）
@@ -176,6 +200,8 @@ def play_fishing(args: dict) -> str:
     if a == "sell":  return engine.cmd(f"sell {args.get('target','')}")
     if a == "open":  return engine.cmd(f"open {args.get('chest_uid','')}")
     if a == "look":  return engine.cmd(f"look {args.get('id','')}")
+    if a == "export": return engine.cmd(f"export {args.get('code','')}".strip())   # code="json" 导出 JSON
+    if a == "import": return engine.import_save(args.get("code", ""))
     return engine.cmd(a)   # status / shop / inventory / encyclopedia
 ```
 

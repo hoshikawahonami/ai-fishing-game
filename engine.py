@@ -2,7 +2,7 @@
 # 对外只用两个接口：cmd("指令") 返回结果文字；new_game(seed) 重开一局。
 # 同 seed + 同指令序列 → 逐位可复现（mulberry32 PRNG，状态存同目录 fishing_save.json）。
 # 想让 AI 不剧透盲玩：用打包版 fishing.py（引擎藏进 blob，AI 只调 cmd()）。
-import json, os, re
+import base64, json, os, re, zlib
 
 # ── 确定性 PRNG（mulberry32，与 JS/TS 同源）──
 def _imul(a, b):
@@ -1256,6 +1256,9 @@ def _load():
             _IO_WARN = "⚠️ 存档读取失败（%s）：已把坏档备份为 %s，并开了一局新的。" % (e, os.path.basename(_SAVE) + ".corrupt")
     else:
         S = _new_state()   # 首次运行，找不到存档是正常的，不提示
+    return _migrate(S)
+def _migrate(S):
+    """老存档/导入存档兼容：缺的新字段按默认补齐（原地修改并返回）。"""
     S.setdefault("items", {}); S.setdefault("pending_chests", []); S.setdefault("seen_letters", {}); S.setdefault("local_dry", 0)
     S.setdefault("fever", 0); S.setdefault("free_bait", 0)
     S.setdefault("oxygen", 0); S.setdefault("oxygen_ever", False)
@@ -1279,6 +1282,79 @@ def _save():
     except Exception as e:
         # 写不进去（目录只读/没权限/磁盘满）：别让玩家以为存上了
         _IO_WARN = "⚠️ 存档写入失败（%s）：本局进度可能不会被保存，检查一下目录权限/磁盘空间。" % e
+
+# ── 存档导出 / 导入：把整局进度压成一段可复制的文本，对话/沙箱丢了也能恢复 ──
+# 存档码格式：FISH1.<crc32 8位hex>.<base64url(zlib(存档JSON))>。纯 ASCII、不含 ; 和空白，贴哪都不怕坏；
+# 带校验和，复制漏了几个字符会被识别出来，不会读进半截存档。随机状态也在里面，导入后确定性照旧。
+_CODE_PREFIX = "FISH1"
+_REQUIRED = {"seed": int, "rngState": int, "turn": int, "season_id": str, "points": int, "location_id": str,
+             "unlocked_locations": list, "bait_inventory": dict, "catch_inventory": list, "encyclopedia": dict}
+
+def export_save(fmt="code"):
+    """导出当前进度。fmt="code"（默认）返回一行存档码；fmt="json" 返回可读的存档 JSON 文本。两种都能被 import_save() 读回。"""
+    _load()
+    raw = json.dumps(S, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if fmt == "json":
+        return json.dumps(S, ensure_ascii=False, indent=1, sort_keys=True)
+    data = raw.encode("utf-8")
+    body = base64.urlsafe_b64encode(zlib.compress(data, 9)).decode("ascii").rstrip("=")
+    return "%s.%08x.%s" % (_CODE_PREFIX, zlib.crc32(data) & 0xFFFFFFFF, body)
+
+def _parse_save(text):
+    """把存档码或存档 JSON 解析成存档 dict；格式/校验不对就抛 ValueError（附中文原因）。"""
+    t = re.sub(r"^```[\w-]*\s*|\s*```$", "", (text or "").strip())   # 聊天里常被包进 ``` 代码块
+    if not t: raise ValueError("没有收到存档内容")
+    if t.startswith("{"):
+        try: st = json.loads(t)
+        except Exception as e: raise ValueError("存档 JSON 解析失败（%s）" % e)
+    else:
+        t = re.sub(r"\s+", "", t).strip("`'\"")   # 聊天窗口可能自动折行/加引号，去掉
+        head, _, rest = t.partition(".")
+        crc, _, body = rest.partition(".")
+        if head != _CODE_PREFIX or not body:
+            raise ValueError("这不是存档码（应以 %s. 开头）" % _CODE_PREFIX)
+        try:
+            data = zlib.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        except Exception:
+            raise ValueError("存档码不完整或被改动过（解码失败）——检查是不是没复制全")
+        if "%08x" % (zlib.crc32(data) & 0xFFFFFFFF) != crc.lower():
+            raise ValueError("存档码校验不通过——可能复制漏了/多了字符")
+        try: st = json.loads(data.decode("utf-8"))
+        except Exception as e: raise ValueError("存档内容损坏（%s）" % e)
+    if not isinstance(st, dict): raise ValueError("存档内容不是一个对象")
+    for k, typ in _REQUIRED.items():
+        if not isinstance(st.get(k), typ) or (typ is int and isinstance(st.get(k), bool)):
+            raise ValueError("存档缺少或损坏了字段 %s" % k)
+    if st["location_id"] not in LOCATIONS: raise ValueError("存档里的地点 %s 不存在" % st["location_id"])
+    if st["season_id"] not in SEASONS: raise ValueError("存档里的季节 %s 不存在" % st["season_id"])
+    return st
+
+def import_save(text):
+    """从 export_save() 导出的存档码或 JSON 恢复进度（覆盖当前存档；原存档先备份成 fishing_save.json.bak）。返回结果文字，不抛异常。"""
+    global S
+    _load()
+    try:
+        st = _parse_save(text)
+    except ValueError as e:
+        return _drain_warn("❌ 导入失败：%s。当前存档没有改动。" % e)
+    try:
+        if os.path.exists(_SAVE):
+            with open(_SAVE, "r", encoding="utf-8") as f: old = f.read()
+            with open(_SAVE + ".bak", "w", encoding="utf-8") as f: f.write(old)
+    except Exception:
+        pass   # 备份失败不挡导入
+    S = _migrate(st)
+    _save()
+    msg = "✅ 存档已恢复！原来的存档备份在 %s。\n%s" % (os.path.basename(_SAVE) + ".bak", _footer())
+    if S.get("expedition"): msg += "\n（这份存档停在水下远征中：choose <编号> 或 surface 继续）"
+    return _drain_warn(msg + "\n" + _state_json())
+
+def _c_export(a):
+    fmt = "json" if (a and a[0].lower() == "json") else "code"
+    body = export_save(fmt)
+    how = "cmd('import <存档码>')" if fmt == "code" else "import_save(<这段 JSON>) 或 cmd('import <这段 JSON>')"
+    return ("💾 存档导出（%s · 图鉴 %d/%d · 回合 %d）——把下面整段原样保存好，以后用 %s 恢复：\n%s"
+            % ("存档码" if fmt == "code" else "JSON", len(S["encyclopedia"]), len(FISH), S["turn"], how, body))
 
 def _eligible(f, loc_id, sea_id):
     lo = "all" in f["locations"] or loc_id in f["locations"]
@@ -1993,6 +2069,8 @@ _HELP = """文字钓鱼游戏（你是玩家）。用点数买鱼饵→抛竿→
   cmd('open <宝箱uid>')        打开钓上来的宝箱（需钥匙或点数）
   cmd('encyclopedia')         看图鉴收集进度
   cmd('look <id或中文名>')     细看鱼/地点/鱼饵/季节/物品（如 cmd('look 月鳞鲤')；没钓到的鱼显示 ？？？）
+  cmd('export')               导出存档码（一行文本）；cmd('export json') 导出可读 JSON。对话/沙箱丢了也能靠它恢复，记得存好
+  cmd('import <存档码>')       从导出的存档码/JSON 恢复进度（覆盖当前局，原存档自动备份为 fishing_save.json.bak）
   cmd('A; B; C')              把多条指令用 ; 或换行串成一批、一次执行（最多 8 条），如 cmd('buy basic_worm 10; cast 10')、cmd('goto reed_river; cast 8 stop=new')
 抛竿偶尔会遇到漂流瓶/宝箱/宝物等惊喜事件；钓到鱼时也偶有幸运时刻（分裂鱼钩/渔获热潮/河神祝福…），可遇不可求。买氧气瓶后可在任意钓点 dive 潜水，捕获只有水下才有的鱼种（水面抛竿钓不到）。每次返回末尾都有一行 📊 状态栏 JSON（点数/地点/季节/回合/图鉴/余饵/未卖渔获；oxygen=氧气瓶、fever=剩余翻倍、free_bait=剩余免饵），看它就够、不必再单独 status。
 goto 清单会标出每个钓点当季还有几种没见过的鱼（含单列的传说级），照着去补图鉴。
@@ -2014,7 +2092,7 @@ def _run_one(line):
     parts = line.split()
     c = parts[0].lower(); a = parts[1:]
     # 远征进行中（水下）：只允许 choose/surface + 只读指令，其余先按下
-    if S.get("expedition") and c not in ("choose", "ch", "surface", "up", "status", "s", "inventory", "inv", "i", "encyclopedia", "enc", "e", "look", "l", "help", "h"):
+    if S.get("expedition") and c not in ("choose", "ch", "surface", "up", "status", "s", "inventory", "inv", "i", "encyclopedia", "enc", "e", "look", "l", "help", "h", "export"):
         return "你还在水下远征中——先 choose <编号> 处理眼前的遗迹，或 surface 返航上岸。"
     try:
         if c in ("help", "h"): return _HELP
@@ -2044,6 +2122,8 @@ def _run_one(line):
         elif c == "sell": return _c_sell(" ".join(a))
         elif c in ("encyclopedia", "enc", "e"): return _c_enc()
         elif c in ("look", "l"): return _c_look(a[0] if a else "")
+        elif c == "export": return _c_export(a)
+        elif c in ("import", "load"): return "导入要单独一条发：cmd('import <存档码>')，别和别的指令串在一起。"
         else: return "未知指令「%s」。调 cmd('help') 看词表。" % c
     except Exception as e:
         # 公开 API 兜底：任何意外（含格式错）都返回友好文字，绝不向调用方抛栈
@@ -2056,6 +2136,9 @@ def cmd(line=""):
     raw = (line or "").strip()
     if not raw:
         return _drain_warn(_HELP + "\n" + _state_json())
+    m = re.match(r"(?i)(import|load)(\s+|$)", raw)
+    if m:   # 导入要吃下整段（JSON 里可能有 ; 和换行），不参与批量拆分
+        return import_save(raw[m.end():]) if raw[m.end():].strip() else _drain_warn("用法：cmd('import <存档码>')，存档码用 cmd('export') 获取。\n" + _state_json())
     subs = [s.strip() for s in re.split(r"[;\n]+", raw) if s.strip()]   # 批量：; 或换行分隔
     if len(subs) > 1:
         run = subs[:_BATCH_MAX]

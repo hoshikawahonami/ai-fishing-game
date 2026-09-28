@@ -1,6 +1,8 @@
 # 游戏存档（每个玩家本地生成，不要提交）
 fishing_save.json
 **/fishing_save.json
+fishing_save.json.bak
+**/fishing_save.json.bak
 
 # Python
 __pycache__/
